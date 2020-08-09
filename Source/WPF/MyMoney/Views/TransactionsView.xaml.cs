@@ -935,6 +935,10 @@ namespace Walkabout.Views
             this.committed = e.Row.Item as Transaction;
             if (this.committed != null)
             {
+                if (this.committed.Splits != null)
+                {
+                    this.committed.Splits.AmountMinusSalesTax = null;
+                }
                 // Note: this must be DispatcherPriority.Background otherwise Rebalance() happens too soon and
                 // doesn't see the new value!
                 this.Dispatcher.BeginInvoke(new Action(Rebalance), DispatcherPriority.Background);
@@ -1979,7 +1983,7 @@ namespace Walkabout.Views
                     bool changed = false;
                     try
                     {
-                        this.myMoney.BeginUpdate();
+                        this.myMoney.BeginUpdate(this);
                         StockQuote quote = sorted[0];
                         foreach (Transaction t in transactions)
                         {
@@ -2964,6 +2968,19 @@ namespace Walkabout.Views
                                     if (args.ChangeType == ChangeType.Deleted || args.ChangeType == ChangeType.Inserted)
                                     {
                                         rebalance = true;
+                                        // optimization tor TransactionCollection
+                                        if (args.ChangeSource != null && args.ChangeSource.GetType() == typeof(TransactionCollection))
+                                        {
+                                            // TransactionCollection will already have taken care of inserts and deletes, so we
+                                            // can optimize this case (refresh is slow).
+                                            rebalance = true;
+                                        }
+                                        else
+                                        { 
+                                            // change came from somewhere else (like OFX import) so need a full refresh.
+                                            refresh = true;
+                                            rebalance = true;
+                                        }
                                     }
                                 }
                             }
@@ -3809,7 +3826,7 @@ namespace Walkabout.Views
             {
                 try
                 {
-                    this.myMoney.BeginUpdate();
+                    this.myMoney.BeginUpdate(this);
                     t.SetBudgeted(!t.IsBudgeted, null);
                 }
                 catch (Exception ex)
@@ -3912,7 +3929,7 @@ namespace Walkabout.Views
                 Category to = dialog.ToCategory;
                 if (to != category)
                 {
-                    this.myMoney.BeginUpdate();
+                    this.myMoney.BeginUpdate(this);
                     try
                     {
                         foreach (Transaction t in this.ViewModel)
@@ -4260,30 +4277,59 @@ namespace Walkabout.Views
 
         void OnDataGridCellEditEnding(object sender, DataGridCellEditEndingEventArgs e)
         {
-            DataGridColumn c = e.Column;
-            if (c.SortMemberPath == "SalesTax")
+            MoneyDataGrid grid = sender as MoneyDataGrid;
+            Transaction t = this.SelectedTransaction;
+            if (t != null && t.IsSplit && grid != null && (e.Column.SortMemberPath == "SalesTax" || e.Column.SortMemberPath == "Debit" || e.Column.SortMemberPath == "Credit"))
             {
-                string text = MoneyDataGrid.GetColumnValue(e.Row, e.Column);
-                if (string.IsNullOrWhiteSpace(text))
+                decimal salesTax = t.SalesTax;
+                decimal amount = t.Amount;
+
+                bool editedTax = TryGetDecimal(grid.GetUncommittedColumnText(e.Row, "SalesTax"), ref salesTax);
+                bool editedAmount = false;
+                if (TryGetDecimal(grid.GetUncommittedColumnText(e.Row, "Debit"), ref amount))
                 {
-                    text = "0";
+                    amount = -amount;
+                    editedAmount = true;
                 }
-                decimal value;
-                if (decimal.TryParse(text, out value))
+                else
                 {
-                    Transaction t = this.SelectedTransaction;
-                    if (t != null)
-                    {
-                        t.PendingSalesTax = value;
-                        if (t.IsSplit)
-                        {
-                            t.NonNullSplits.Rebalance();
-                        }
-                    }
+                    editedAmount = TryGetDecimal(grid.GetUncommittedColumnText(e.Row, "Credit"), ref amount);
                 }
+
+                if (amount < 0)
+                {
+                    amount += salesTax;
+                }
+                else
+                {
+                    amount -= salesTax; // then it was a refund, so sales tax was refunded also!
+                }
+
+                if (editedAmount || editedTax)
+                {
+                    t.NonNullSplits.AmountMinusSalesTax = amount;
+                }
+                else
+                {
+                    t.NonNullSplits.AmountMinusSalesTax = null;
+                }
+                t.NonNullSplits.Rebalance();
             }
         }
 
+        bool TryGetDecimal(string s, ref decimal value)
+        {
+            if (!string.IsNullOrEmpty(s))
+            {
+                decimal v;
+                if (decimal.TryParse(s, out v))
+                {
+                    value = v;
+                    return true;
+                }
+            }
+            return false;
+        }
 
         private void ComboBoxForPayee_PreviewLostKeyboardFocus(object sender, KeyboardFocusChangedEventArgs e)
         {
@@ -5035,7 +5081,7 @@ namespace Walkabout.Views
                 // The Begin/EndUpdate stops the TransactionControl from doing a Refresh which is what we want.
                 if (!constructing)
                 {
-                    this.money.BeginUpdate();
+                    this.money.BeginUpdate(this);
                     this.money.Transactions.AddTransaction(t);
                     this.money.EndUpdate();
                 }
@@ -5060,7 +5106,7 @@ namespace Walkabout.Views
                 {
                     if (Keyboard.IsKeyDown(Key.LeftShift) || Keyboard.IsKeyDown(Key.RightShift) || !Prompt || ConfirmDelete())
                     {
-                        this.money.BeginUpdate();
+                        this.money.BeginUpdate(this);
                         try
                         {
                             this.money.RemoveTransaction(t);
@@ -6635,7 +6681,7 @@ namespace Walkabout.Views
             Transaction t = box.DataContext as Transaction;
             if (t != null)
             {
-                t.BeginUpdate();
+                t.BeginUpdate(this);
                 if (!t.IsBudgeted)
                 {
                     t.IsBudgeted = true;

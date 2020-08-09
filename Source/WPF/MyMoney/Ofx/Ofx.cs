@@ -1092,6 +1092,10 @@ NEWFILEUID:{1}
             {
                 result = SendOfxRequest(doc, "NONE", fileuid);
             }
+            catch (HtmlResponseException)
+            {
+                throw;
+            }
             catch (Exception)
             {
                 // try a different version of OFX
@@ -1171,13 +1175,29 @@ NEWFILEUID:{1}
             XDocument doc = this.GetProfileRequest(lastGetProfileDate);
             SaveLog(doc, GetLogfileName(this.onlineAccount) + "PROF_RQ.xml");
 
-            doc = SendOfxRequest(doc);
+            OFX ofx = null;
+            try
+            {
+                doc = SendOfxRequest(doc);
+                // deserialize response into our OfxProfile structure.
+                ofx = DeserializeOfxResponse(doc);
 
-            // deserialize response into our OfxProfile structure.
+                CheckSignOnStatusError(ofx);
+            }
+            catch (Exception ex)
+            {
+                if (File.Exists(cache))
+                {
+                    // then return the cached profile.
+                    doc = XDocument.Load(cache);
+                    ofx = DeserializeOfxResponse(doc);
+                }
+                else
+                {
+                    throw ex;
+                }
+            }
 
-            OFX ofx = DeserializeOfxResponse(doc);
-
-            CheckSignOnStatusError(ofx);
 
             if (ofx.ProfileMessageSet == null || ofx.ProfileMessageSet.ProfileMessageResponse == null)
             {
@@ -1440,12 +1460,35 @@ NEWFILEUID:{1}
 
             OFX ofx = DeserializeOfxResponse(doc);
 
-            CheckSignOnStatusError(ofx);
+            OfxException e = GetSignOnStatusError(ofx);
+
+            var status = ofx?.SignUpMessageResponse?.AccountInfoSet?.OfxStatus;
+            if (status != null && status.Code != 0)
+            {
+                string sev = status.Severity ?? "Error";
+                OfxErrorCode code = (OfxErrorCode)status.Code;
+                string message = status.Message ?? string.Format("Sign up failed with {0} code {1}({2})", sev, code.ToString(), status.Code);
+
+                if (e != null)
+                {
+                    message += "\n" + e.Message;
+                }
+
+                e = new OfxException(message, code.ToString(), null, null)
+                {
+                    Root = ofx,
+                    OfxError = (OfxErrorCode)status.Code
+                };
+            }
+            if (e != null)
+            {
+                throw e;
+            }
 
             return ofx;
         }
 
-        internal void CheckSignOnStatusError(OFX ofx)
+        internal OfxException GetSignOnStatusError(OFX ofx)
         {
             var sms = ofx.SignOnMessageResponse;
             if (sms != null)
@@ -1474,13 +1517,24 @@ NEWFILEUID:{1}
                         string sev = status.Severity ?? "Error";
                         OfxErrorCode code = (OfxErrorCode)status.Code;
                         string message = status.Message ?? string.Format("Sign on failed with {0} code {1}({2})", sev, code.ToString(), status.Code);
-                        throw new OfxException(message, code.ToString(), null, null)
+
+                        return new OfxException(message, code.ToString(), null, null)
                         {
                             Root = ofx,
                             OfxError = (OfxErrorCode)status.Code
                         };
                     }
                 }
+            }
+            return null;
+        }
+
+        internal void CheckSignOnStatusError(OFX ofx)
+        {
+            var e = GetSignOnStatusError(ofx);
+            if (e != null)
+            {
+                throw e;
             }
         }
 
@@ -1621,6 +1675,7 @@ NEWFILEUID:{1}
             bool justWhitespace = true;
             int headerLines = 0;
 
+            // First just look for a CHARSET header so we can re-decode the content properly.
             while ((line = sr.ReadLine()) != null)
             {
                 line = line.Trim();
@@ -1635,12 +1690,17 @@ NEWFILEUID:{1}
                 {
                     break;
                 }
+                int pos = line.IndexOf("<OFX>");
+                if (pos > 0)
+                {
+                    // invalid response format, the <OFX> tag should be on it's own line!
+                    line = line.Substring(0, pos);
+                }
                 if (string.IsNullOrWhiteSpace(line))
                 {
                     if (justWhitespace)
                     {
                         headerLines++;
-
                         // ignore beginning newlines.
                     }
                     else
@@ -1744,10 +1804,23 @@ NEWFILEUID:{1}
             // re-encode in the right encoding and read up to the starting <OFX> tag.
             stm.Seek(0, SeekOrigin.Begin);
             sr = new StreamReader(stm, enc);
+            StringBuilder sb = new StringBuilder();
 
             // skip the header.
-            while ((line = sr.ReadLine()) != null && --headerLines > 0)
+            while ((line = sr.ReadLine()) != null)
             {
+                int pos = line.IndexOf("<OFX>");
+                if (pos >= 0)
+                {
+                    // try and salvage an invalid format OFX file.
+                    line = line.Substring(pos);
+                    sb.AppendLine(line);
+                    headerLines = 0;
+                }
+                else if (headerLines == 0)
+                {
+                    sb.AppendLine(line);
+                }
             }
 
             using (SgmlReader sgml = new SgmlReader())
@@ -1756,7 +1829,7 @@ NEWFILEUID:{1}
                 StreamReader dtdReader = new StreamReader(typeof(OfxRequest).Assembly.GetManifestResourceStream(name));
                 sgml.Dtd = SgmlDtd.Parse(null, "OFX", null, dtdReader, null, null, new NameTable());
 
-                sgml.InputStream = sr;
+                sgml.InputStream = new StringReader(sb.ToString());
 
                 doc = XDocument.Load(sgml);
 
@@ -1889,7 +1962,7 @@ Please save the log file '{0}' so we can implement this", GetLogFileLocation(doc
                 }
                 else
                 {
-                    this.myMoney.BeginUpdate();
+                    this.myMoney.BeginUpdate(this);
                     try
                     {
                         switch (child.Name.LocalName)
@@ -3037,7 +3110,7 @@ Please save the log file '{0}' so we can implement this", GetLogFileLocation(doc
             Transactions register = this.myMoney.Transactions;
 
             // update last sync date.                
-            this.myMoney.BeginUpdate();
+            this.myMoney.BeginUpdate(this);
             try
             {
                 a.LastSync = DateTime.Today;
@@ -3272,6 +3345,61 @@ Please save the log file '{0}' so we can implement this", GetLogFileLocation(doc
 
         public delegate Account PickAccountDelegate(MyMoney money, Account accountTemplate);
 
+        static Regex ObfuscatedId = new Regex("([X]+)([0-9]+)");
+
+        private bool AccoundIdMatches(string downloadedId, string localId)
+        {
+            if (string.IsNullOrEmpty(localId))
+            {
+                return false;
+            }
+            if (string.Compare(downloadedId, localId, StringComparison.OrdinalIgnoreCase) == 0)
+            {
+                return true;
+            }
+            return false;
+        }
+
+        private Account AccountIdFuzzyMatch(string downloadedId)
+        {
+            Account matched = null;
+            var m = ObfuscatedId.Match(downloadedId);
+            if (m.Success && m.Groups.Count == 3)
+            {
+                var exs = m.Groups[1].Value;
+                var tail = m.Groups[2].Value;
+
+                foreach (Account acct in this.myMoney.Accounts.GetAccounts())
+                {
+                    foreach (string localId in new string[] {  acct.AccountId, acct.OfxAccountId })
+                    {
+                        if (!string.IsNullOrEmpty(localId))
+                        {
+                            var trimmedLocalId = localId.Replace(" ", "").Trim();
+                            if (trimmedLocalId.Length == downloadedId.Length)
+                            {
+                                var localTail = trimmedLocalId.Substring(exs.Length);
+                                if (string.Compare(tail, localTail, StringComparison.OrdinalIgnoreCase) == 0)
+                                {
+                                    if (matched != null && matched != acct)
+                                    {
+                                        // ambiguouis!
+                                        return null;
+                                    }
+                                    else
+                                    {
+                                        matched = acct;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            return matched;
+        }
+
         // Find account matching the given id.
         private Account FindAccountByOfxId(string accountId)
         {
@@ -3279,17 +3407,18 @@ Please save the log file '{0}' so we can implement this", GetLogFileLocation(doc
             {
                 foreach (Account acct in this.myMoney.Accounts.GetAccounts())
                 {
-                    if (!string.IsNullOrEmpty(acct.AccountId) && acct.AccountId == accountId)
+                    if (AccoundIdMatches(accountId, acct.AccountId))
                     {
                         return acct;
                     }
-                    if (!string.IsNullOrEmpty(acct.OfxAccountId) && acct.OfxAccountId == accountId)
+                    if (AccoundIdMatches(accountId, acct.OfxAccountId))
                     {
                         return acct;
                     }
                 }
-            }
 
+                return AccountIdFuzzyMatch(accountId);
+            }
             return null;
         }
 

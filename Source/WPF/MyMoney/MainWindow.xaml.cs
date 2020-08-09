@@ -38,6 +38,7 @@ using Walkabout.Interfaces.Reports;
 using Walkabout.Interfaces.Views;
 using System.Deployment.Application;
 using System.Threading.Tasks;
+using System.Security.Policy;
 
 #if PerformanceBlocks
 using Microsoft.VisualStudio.Diagnostics.PerformanceProvider;
@@ -54,7 +55,7 @@ namespace Walkabout
         #region PROPERTIES PRIVATE
 
         internal static Uri DownloadSite = new Uri("http://www.lovettsoftware.com/Downloads/MyMoney/");
-
+        internal static string InstallUrl = "https://github.com/clovett/myMoney.Net";
 
         private Settings settings;
         private UndoManager navigator;
@@ -541,7 +542,7 @@ namespace Walkabout
                 }
                 UpdateCaption(null);
 
-                myMoney.BeginUpdate();
+                myMoney.BeginUpdate(this);
                 try
                 {
                     if (this.database != null)
@@ -630,7 +631,7 @@ namespace Walkabout
 
         void AfterLoadChecks()
         {
-            myMoney.BeginUpdate();
+            myMoney.BeginUpdate(this);
             try
             {
                 // remove dangling transactions.
@@ -2689,7 +2690,7 @@ namespace Walkabout
             using (PerformanceBlock.Create(ComponentId.Money, CategoryId.View, MeasurementId.UpdateCharts))
             {
 #endif
-                this.myMoney.BeginUpdate();
+                this.myMoney.BeginUpdate(this);
                 try
                 {
 
@@ -4233,7 +4234,7 @@ namespace Walkabout
                 return;
             }
 
-            InternetExplorer.OpenUrl(IntPtr.Zero, new Uri(DownloadSite, "MyMoney.application"));
+            InternetExplorer.OpenUrl(IntPtr.Zero, new Uri(InstallUrl));
             Close();
         }
 
